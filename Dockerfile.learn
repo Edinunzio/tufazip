@@ -1,0 +1,26 @@
+# CPU-only environment for the learning exercises (exercises/*.py).
+# NOT for the real tufazip decoder, which needs 2x B200 GPUs, CUDA 13, and the
+# exact pinned stack in uv.lock.
+#
+# Build:  docker build -f Dockerfile.learn -t tufazip-learn .
+# Run:    docker run --rm -it -v "$PWD":/work tufazip-learn python exercises/01_order0_coder.py
+# Shell:  docker run --rm -it -v "$PWD":/work tufazip-learn bash
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+# CPU wheels come from PyTorch's own index (the default PyPI wheel drags in
+# gigabytes of CUDA libraries on Linux). Works on both arm64 (Mac mini) and x86-64.
+# Versions are deliberately unpinned: these are toy exercises, not a bit-exact decoder.
+RUN pip install --index-url https://download.pytorch.org/whl/cpu torch \
+ && pip install numpy
+
+# Run as an unprivileged user so files written into the mounted repo aren't root-owned
+# on Linux hosts, and a bug in an exercise can't touch the container as root.
+RUN useradd --create-home learner
+USER learner
+WORKDIR /work
+
+CMD ["python"]

@@ -1,0 +1,13 @@
+# The learn image only holds the Python environment; the repo is bind-mounted
+# at run time, so none of this needs to be in the build context.
+.git
+.venv
+__pycache__
+*.pyc
+weights.bin
+enwik9*
+tufazip-state
+tufazip-v2-state
+dist
+docs
+exercises
