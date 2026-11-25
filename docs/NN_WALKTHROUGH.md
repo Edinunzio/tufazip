@@ -4,13 +4,13 @@ A guided read of the real tufazip model and codec. It assumes you have run (or a
 skimmed) the exercises, especially `04_tiny_transformer.py`, which is this file's model
 shrunk down. Line numbers refer to `nn.py` as of this fork's `master`.
 
-**Status: Parts A and B of D are written.** The file is 1,738 lines, so the guide is split:
+**Status: Parts A, B and C of D are written.** The file is 1,738 lines, so the guide is split:
 
 | Part | Lines | What it covers | Status |
 |---|---|---|---|
 | **A** | 1-120, 122-336 | Imports, config, benchmark helpers, **the model** | written (below) |
 | **B** | 339-640 | The packed-weights loader (`weights.bin`) | written (below) |
-| C | 641-855 | Helpers: LR schedules, frequency table, CLI arguments | not yet written |
+| **C** | 641-855 | Helpers: LR schedules, frequency table, CLI arguments | written (below) |
 | D | 859-1737 | `main()`: the online encode/decode loop, retraining, checkpoints | not yet written |
 
 Where Part A touches something that only `main()` can settle, it says so instead of
@@ -650,4 +650,260 @@ price is a rougher starting point, which the online learning has to make up.
 
 ---
 
-*Parts C and D follow once Part B is reviewed.*
+---
+
+# Part C: helpers and command-line arguments (lines 641-855)
+
+Small functions, then one very long `argparse` block. The helpers are short but each
+one connects to something earlier; the argument list is the most compact **catalogue of
+every knob** in the system, and it settles several questions Part A left open.
+
+## `load_tokens` (lines 644-646)
+
+```python
+def load_tokens(path):
+    with open(path, "rb") as f:
+        return np.frombuffer(f.read(), dtype=">u2").astype(np.int64)
+```
+
+The tokenized input (what `preprocess.c` produces from the text) is a plain file of
+**2-byte numbers**. `">u2"` means big-endian ("`>`") unsigned 16-bit integer. 16 bits
+holds up to 65,535, comfortably more than the 4,097-token vocabulary. `astype(np.int64)`
+widens to the type PyTorch's embedding lookup wants. So the input to the model is just
+a long array of token numbers, as in the rungs' arrays of byte values.
+
+## `lr_at`: warmup, then cosine decay (lines 649-656)
+
+```python
+def lr_at(step, peak_lr, min_lr, warmup, total_steps):
+    if step < warmup:
+        return peak_lr * (step + 1) / warmup               # ramp up linearly
+    if step >= total_steps:
+        return min_lr
+    progress = (step - warmup) / max(1, total_steps - warmup)
+    return min_lr + 0.5 * (peak_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
+```
+
+**Why:** the learning rate is the size of each nudge (the lesson from rung 3: too big
+overshoots, too small is slow). Starting at full size can wreck a fresh model, so the
+rate **ramps up** during `warmup` steps, then **glides down** along half a cosine wave
+to `min_lr`. The cosine is a smooth curve from 1 to 0: `0.5 * (1 + cos(pi * progress))`
+is 1 at the start (`progress = 0`), 0.5 in the middle, 0 at the end.
+
+With the real settings (`lr = 4e-5`, `warmup = 200`; assuming `min_lr = lr x
+min_lr_ratio = 1e-5`, which `main()` should confirm; and an **illustrative**
+`total_steps = 10,000`, since the real value is computed in `main()`), I ran the
+function:
+
+| step | lr |
+|---|---|
+| 0 | 2.0e-07 (just starting) |
+| 99 | 2.0e-05 (halfway up) |
+| 199-200 | 4.0e-05 (peak) |
+| 5,000 | 2.5e-05 |
+| 7,500 | 1.5e-05 |
+| 9,999+ | 1.0e-05 (floor) |
+
+## `parse_piecewise_lr` and `piecewise_lr_at` (lines 659-686)
+
+A second, more flexible schedule, used for the **retraining** passes (see below).
+The syntax is `lr0[,step1,lr1,step2,lr2,...]`: a starting rate, then pairs of
+"by this step, be at this rate", with **straight lines between the points**. There must
+be an **odd** number of comma-separated parts (line 662) and the steps must strictly
+increase (line 670); I confirmed both errors by feeding it bad input.
+
+V2's retrain schedule is `1.6e-4,13000,1.6e-4,93000,7.9e-5,163000,4.0e-5,1911300,1.3e-5`,
+which parses to five points. Ran against it:
+
+| global step | lr | |
+|---|---|---|
+| 0 - 13,000 | 1.60e-04 | flat |
+| 53,000 | 1.20e-04 | sliding down |
+| 93,000 | 7.90e-05 | |
+| 163,000 | 4.00e-05 | |
+| 1,000,000 | 2.7e-05 | |
+| 1,911,300 and beyond | 1.30e-05 | stays at the last value |
+
+So the retrain rate **starts 4x higher than the online peak** (1.6e-4 vs 4e-5) and
+decays by about 12x. It is indexed by a **global step counter** (the argument's help
+text says so), so each new retrain call continues the schedule rather than restarting.
+
+## `make_freq_table` (lines 689-693)
+
+```python
+def make_freq_table(logits):
+    """Cumulative integer frequency table per row, as the arithmetic coder wants."""
+    prob = F.softmax(logits.detach(), dim=-1)
+    freq = torch.clamp(torch.round(prob * FREQ_TOTAL).to(torch.int32), min=1)
+    return torch.cumsum(freq, dim=-1).cpu().numpy()
+```
+
+**This is the bridge from the model to the arithmetic coder.** Four steps:
+
+1. `softmax`: logits to probabilities (they sum to 1).
+2. `prob * FREQ_TOTAL` then `round`: scale to integers summing to about 10,000,000.
+3. `clamp(min=1)`: **every token gets at least a width of 1**, so even an
+   "impossible" token can still be coded (it just costs a lot). This is the same
+   "floor of 1" reason rung 1 started every count at 1.
+4. `cumsum` along the last axis: turn "width per token" into "where each token's slice
+   *ends*", the form the coder wants. Then `.cpu().numpy()`: it leaves the GPU.
+
+**Rungs 2-4 each have their own `to_freqs` with exactly this recipe** (NumPy rather than
+PyTorch). `logits.detach()` cuts the gradient connection, since this is for coding, not
+learning. The "per row" in the docstring means it handles many positions at once.
+
+## `NullSummaryWriter` (lines 696-709)
+
+Four methods that do nothing: `add_scalar`, `add_hparams`, `flush`, `close`. Its
+docstring: "Rank-local no-op writer; only rank zero owns durable logs." With two GPUs
+(two "ranks"), only rank 0 writes TensorBoard logs; presumably the other gets this
+stand-in with the same interface, so the rest of the code can call `writer.add_scalar(...)` without
+checking which rank it is.
+
+## `parse_args` (lines 712-853)
+
+### The key trick: the last three lines
+
+```python
+p.set_defaults(**V2_CONFIG,
+               vocab_file=os.path.join(os.path.dirname(__file__), "enwik9.voc"),
+               initial_prior=os.path.join(os.path.dirname(__file__), "weights.bin"))
+```
+
+Every `add_argument` has a default (`--d_model` is 512, `--dropout` is 0.0,
+`--ctx_len` is 512, `--lr` is 5e-4, ...), **and then `set_defaults` overwrites them with
+`V2_CONFIG`** (`d_model` 1024, `dropout` 0.25, `ctx_len` 192, `lr` 4e-5, ...) and points
+the vocabulary and prior at `enwik9.voc` and `weights.bin` next to the script. So:
+
+- Running with just `--input` gets the **v2 bitstream's exact settings**.
+- Any flag you pass on the command line still overrides these (`set_defaults` only
+  changes defaults, not what the command line says).
+- The defaults you see in `add_argument(...)` lines are **historical or generic and are
+  not what v2 uses.** When reading, check `V2_CONFIG` for the real value.
+- `--untie_embeddings` is a `store_true` flag, and `V2_CONFIG` sets it `True`. There is
+  **no flag that turns it back off**, so from the command line the embeddings can't
+  be re-tied.
+
+### What each group of arguments does
+
+**I/O**
+
+| Argument | Meaning |
+|---|---|
+| `--input` (required) | Tokenized input (or the compressed file with `--decompress`) |
+| `--output` | Output file; defaults under `--work_dir` |
+| `--decompress` | Decode instead of encode |
+| `--no_coding` | "skip the arithmetic coder; just train and report bits/token": measures how well the model predicts **without** producing a file |
+| `--max_tokens` | Limit input tokens, for quick tests (0 = all) |
+| `--raw_bytes` | Original file size, enabling **bits/byte** logging (the enwik benchmark's metric) |
+| `--vocab_bytes` | "serialized vocabulary size for separate benchmark-total metrics" |
+| `--vocab_file` | Vocabulary whose SHA-256 a `QPI1` prior pins (Part B) |
+| `--initial_prior` | "**transmitted** QPI1 shallow-model initialization archive" (`weights.bin`). The word *transmitted* suggests it is counted as part of what is shipped, but this walkthrough hasn't confirmed how the benchmark total treats it; Part D should say |
+| `--external_decompressor_bytes` | For non-Transformer backends only: bytes of external runtime dependencies; "-1 = unaccounted" |
+
+**Model** (real values are in `V2_CONFIG`; see Part A)
+`--n_layer --d_model --n_head --d_inner --ctx_len --dropout --untie_embeddings
+--position_type --no_qk_norm --norm_style`, plus `--vocab_size` (default 16,388; V2 uses
+4,097).
+
+Two comments in the source are worth reading in full:
+
+- Lines 747-751 explain `d_inner`: `ceil(8/3 * d_model / 256) * 256`, because SwiGLU has
+  three matrices where a ReLU feed-forward has two, so `4 x 2/3 = 8/3` keeps the
+  parameter count equal. (Confirms what Part A said.)
+- Lines 753-757 explain a longer context: "the Python arithmetic coder dominates wall
+  time, so the ~4x extra compute per step is mostly absorbed". **The coder is the
+  bottleneck, not the neural net**, so a larger context is nearly free. They also say
+  Bellard's NNCP v2 effectively used ~1024.
+
+**Other architectures:** `--model_backend` can be `transformer` (V2), `mamba2`,
+`mamba3` or `kda`, with their own `--ssm_*`, `--mamba3_*` and `--kda_*` flags. These are
+alternative model designs; **this walkthrough does not cover them.** The files they need
+(`ssm_models.py`, `kda_models.py`, `tokenizers.py`) are not in this repository.
+
+**Online learning and training** (the part that most differs from the rungs)
+
+| Argument | Default | V2 | What it does |
+|---|---|---|---|
+| `--online_loss` | `window` | **`code`** | `window` "repeats all context targets (legacy)"; `code` "trains only the newly coded target, matching NNCP's online exposure" |
+| `--project_only_targets` | off | on | "apply the vocabulary head only to supervised positions; requires `--online_loss code`". This is why `Transformer.forward` has `output_positions` (Part A) |
+| `--lr` | 5e-4 | 4e-5 | Peak online learning rate |
+| `--min_lr_ratio` | 0.1 | 0.25 | Floor as a fraction of peak |
+| `--warmup` | 200 | 200 | Steps of linear ramp-up |
+| `--clip` | 0.25 | 0.25 | Gradient clipping size |
+| `--beta1` | 0.0 | 0.0 | Adam momentum: **off** |
+| `--beta2` | 0.9999 | 0.9999 | Adam's long-memory average of squared gradients |
+| `--adam_eps` | 1e-8 | 1e-9 | Adam's small constant for stability |
+| `--batch_size` | 64 | 64 | |
+| `--block_len` | 500,000 | 500,000 | "tokens per block; streams are batched within a block" |
+
+The comment at lines 789-790 explains why the default peak LR was raised from 3e-4 to
+5e-4: QK-norm and peri-norm make the model tolerate a higher rate.
+
+**Retraining** ("extra passes over the already-coded prefix (valid because both the
+compressor and decompressor hold it)", comment at lines 805-806). **This is the real
+version of the "replay" in rungs 3 and 4.** Both sides have already seen the earlier
+tokens, so both can re-study them without any extra information.
+
+| Argument | V2 | Meaning |
+|---|---|---|
+| `--retrain_period` | 1 | Retrain every N symbols, checked only at **block boundaries**, so the real period rounds up to a multiple of `block_len` (500,000). With 1 it happens at **every block boundary** |
+| `--retrain_len` | 35,000,000 | Train on at most this many **trailing** symbols of the coded prefix |
+| `--retrain_epochs` | 1 | Passes over that window |
+| `--retrain_early_epochs`, `--retrain_early_until` | unset (0) | Optionally use a different epoch count early on |
+| `--retrain_lr` | the piecewise schedule above | |
+| `--retrain_update_len` | 64 | New targets per optimizer update (0 = `ctx_len`) |
+| `--retrain_batch_size` | 32 | Independent retraining streams (0 = `batch_size`) |
+
+**Runtime and infrastructure**
+
+| Argument | Meaning |
+|---|---|
+| `--cpu`, `--dtype` (bf16 / fp32) | Force CPU; working number format (V2 uses bf16) |
+| `--distributed` | "run a deterministic single-node DDP codec under torchrun; **world size is part of the codec and must match on decode/resume**" |
+| `--work_dir`, `--run_name`, `--run_dir`, `--log_interval` | Where logs and outputs go, and how often progress is reported |
+| `--checkpoint_dir` | "persistent directory for latest.pt; **an existing checkpoint is resumed automatically**" |
+| `--checkpoint_every_blocks` | How often to save (V2: every 4 blocks) |
+| `--stop_after_blocks` | Hidden from `--help`; presumably for testing |
+| `--seed` | 1111 |
+
+The `--distributed` line is the most important one for anyone hoping to reproduce this:
+the **number of GPUs is itself part of the algorithm**: the help text says "world size
+is part of the codec and must match on decode/resume". The likely reason (my inference;
+Part D should confirm) is that distributed training splits the batch across processes and
+combines their gradients, which changes the order of floating-point additions, so a
+different world size would give slightly different numbers than the encoder had. That is
+why `nn.py`'s docstring points to the README's "two-B200 hardware" requirement, not just
+"some GPUs".
+
+`--run_dir` is described as "stable across Slurm requeues", and
+`--checkpoint_every_blocks` mentions "a Slurm stop request": this was run on a shared
+cluster whose scheduler can stop and restart jobs, which is what `checkpoint_utils` and
+`REQUEUE_EXIT_CODE` (Part A imports) are for.
+
+## What differs between rung 4 and the real training setup
+
+This table is the main payoff of Part C: **the exercise taught the idea but not these
+settings.**
+
+| | Rung 4 | Real (V2) |
+|---|---|---|
+| What each update trains on | whole window, every position (the legacy `window`-style) | **only the newly coded target** (`online_loss code`) |
+| Adam momentum (`beta1`) | 0.9 (default) | **0.0** |
+| Adam `beta2` | 0.999 (default) | 0.9999 |
+| Gradient clip | 1.0 | 0.25 |
+| Online LR | 3e-3, constant | 4e-5 peak, warmup then cosine to 1e-5 |
+| Replay | 2 random earlier windows per byte | **every 500,000 tokens: re-train on up to 35M trailing tokens** at a decaying LR |
+| Dropout | none | 0.25 |
+| Number format | float32 | bf16 |
+| GPUs | 1 CPU thread | 2 GPUs, and the count is part of the codec |
+
+**Correction to something I said earlier in this project:** when writing rung 4 I said
+`nn.py` trains on the whole window like my toy does. That was wrong for V2: V2 sets
+`online_loss = 'code'`, which trains **only on the newly coded target**. The whole-window
+style my exercise uses is the "legacy" mode here. My toy's choice was a reasonable one
+for a tiny model, but it is not what the real codec does.
+
+---
+
+*Part D follows once Part C is reviewed.*
