@@ -24,20 +24,33 @@ One deliberate difference: nn.py uses RoPE to tell the model about order; here a
 plain learned position embedding does the same job and is easier to read. RoPE is
 covered in docs/NN_WALKTHROUGH.md.
 
-PART 1 (this part): the model classes, plus two checks.
-PART 2 (next): the encoder/decoder loop that turns these probabilities into bits.
+PART 1: the model classes, plus two checks (does it have the claimed shape, and does
+        the causal mask hold?).
+PART 2: the encoder/decoder loop that turns these probabilities into bits, learning
+        online exactly like rung 3: after coding each byte, nudge the weights so that
+        byte was a little more likely. The decoder makes the SAME nudges. Unlike rung
+        3, one update trains on the whole window (a Transformer predicts at every
+        position at once, about CTX training signals per step), and the optimizer is
+        Adam with gradient clipping, as in nn.py, instead of plain SGD.
 
 Run (from the repo root):
     docker run --rm -v "$PWD":/work tufazip-learn python exercises/04_tiny_transformer.py
 """
+import io
 import math
+import sys
+import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from arithmetic_coder import (ArithmeticDecoder, ArithmeticEncoder,  # noqa: E402
+                              BitInputStream, BitOutputStream)
 
 VOCAB = 256     # one entry per possible byte
 CTX = 32        # how many previous bytes attention can look back over
@@ -209,5 +222,149 @@ def part1_checks():
     assert same_before and moved_last
 
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# PART 2: from probabilities to bits.
+# ---------------------------------------------------------------------------
+STATE_BITS = 32
+FREQ_TOTAL = 10_000_000  # same resolution nn.py hands to the coder
+LR = 3e-3        # Adam step size. (nn.py uses 4e-5 for a 160M-parameter model; a
+                 # 69k-parameter model on 8 KB can afford a much bigger step.)
+CLIP = 1.0       # cap on the size of one update, so a surprising byte can't wreck it
+REPLAY = 2       # extra random earlier windows re-studied after each new byte
+BOS = 0          # start-of-text marker: byte 0 never occurs in the sample text
+N_BYTES = 8000   # how much of sample.txt to code. None = the whole 39,785 bytes
+                 # (about 5x slower: every byte costs a forward+backward pass or three)
+
+
+class KeepOpenBytesIO(io.BytesIO):
+    def close(self):
+        pass
+
+
+def seq_ending_at(history, end):
+    """The last CTX+1 values of [BOS, history[0], ..., history[end-1]].
+
+    As a model INPUT we use the last CTX of these; the same list shifted by one is the
+    TARGET (what each position should have predicted). The window slides as we go, so
+    position 0 of the window is whichever byte is CTX back."""
+    return (bytes([BOS]) + bytes(history[max(0, end - CTX):end]))[-(CTX + 1):]
+
+
+def as_ids(values):
+    return torch.tensor(list(values), dtype=torch.long)[None]    # [1, T]
+
+
+class TransformerModel:
+    """predict / update, the same interface as rungs 2 and 3."""
+
+    def __init__(self):
+        torch.manual_seed(0)           # encoder and decoder must start IDENTICAL
+        self.net = TinyTransformer()
+        self.opt = torch.optim.AdamW(self.net.parameters(), lr=LR, weight_decay=0.0)
+        self.rng = np.random.default_rng(1)   # replay choices: identical on both sides
+        self._logits = None
+
+    def predict(self, history):
+        """P(next byte) as 256 probabilities. Keeps the graph for update()."""
+        ids = as_ids(seq_ending_at(history, len(history))[-CTX:])
+        self._logits = self.net(ids)[0]                          # [T, 256]
+        # The newest position's logits predict the byte we are about to code.
+        return torch.softmax(self._logits[-1].detach().double(), -1).numpy()
+
+    def _learn(self, logits, targets):
+        loss = F.cross_entropy(logits, targets)       # mean -log P(true byte), per position
+        self.opt.zero_grad()
+        loss.backward()                               # autograd = rung 3's backward()
+        nn.utils.clip_grad_norm_(self.net.parameters(), CLIP)
+        self.opt.step()
+
+    def update(self, history, symbol):
+        """Learn from `symbol`, which followed `history`. Call AFTER coding it."""
+        grown = bytes(history) + bytes([symbol])
+        seq = seq_ending_at(grown, len(grown))
+        # Reuse predict()'s logits: its input was exactly seq[:-1]. Target at each
+        # position is simply the next byte of the window.
+        self._learn(self._logits, as_ids(seq[1:])[0])
+        for _ in range(REPLAY):                       # re-study random known bytes
+            if len(history) == 0:
+                break
+            j = int(self.rng.integers(0, len(history)))
+            seq = seq_ending_at(history, j + 1)
+            self._learn(self.net(as_ids(seq[:-1]))[0], as_ids(seq[1:])[0])
+
+
+def to_freqs(p):
+    """Probabilities -> cumulative integer table (same recipe as rungs 2-3)."""
+    freq = np.maximum(np.round(p * FREQ_TOTAL).astype(np.int64), 1)
+    return np.cumsum(freq)
+
+
+def encode(data):
+    model = TransformerModel()
+    out = KeepOpenBytesIO()
+    out.write(len(data).to_bytes(4, "big"))
+    bits = BitOutputStream(out)
+    encoder = ArithmeticEncoder(STATE_BITS, bits)
+
+    history, costs = bytearray(), []
+    for byte in data:
+        freqs = to_freqs(model.predict(history))
+        costs.append(-math.log2((freqs[byte] - (freqs[byte - 1] if byte else 0)) / freqs[-1]))
+        encoder.write(freqs, byte)
+        model.update(history, byte)
+        history.append(byte)
+    encoder.finish()
+    bits.close()
+    return out.getvalue(), costs
+
+
+def decode(blob):
+    n = int.from_bytes(blob[:4], "big")
+    decoder = ArithmeticDecoder(STATE_BITS, BitInputStream(io.BytesIO(blob[4:])))
+    model = TransformerModel()
+    history = bytearray()
+    for _ in range(n):
+        byte = decoder.read(to_freqs(model.predict(history)))
+        model.update(history, byte)
+        history.append(byte)
+    return bytes(history)
+
+
+def main():
+    torch.set_num_threads(1)   # one thread: tiny model, and reproducible float sums
     part1_checks()
+    data = (ROOT / "exercises" / "sample.txt").read_bytes()
+    if N_BYTES is not None:
+        data = data[:N_BYTES]
+    n = len(data)
+    print(f"\ninput: {n:,} bytes. References on the FULL 39,785 bytes: order-0 4.638, "
+          f"order-3 2.652, rung-3 net 3.364 bits/byte")
+
+    t0 = time.time()
+    blob, costs = encode(data)
+    t1 = time.time()
+    restored = decode(blob)
+    t2 = time.time()
+
+    print(f"compressed: {len(blob):,} bytes = {len(blob) * 8 / n:.3f} bits/byte "
+          f"({n / len(blob):.2f}x)   [encode {t1 - t0:.0f}s, decode {t2 - t1:.0f}s]")
+    print("\nlearning curve (bits/byte over each quarter of the input):")
+    q = n // 4
+    for i in range(4):
+        part = costs[i * q:(i + 1) * q if i < 3 else n]
+        print(f"  quarter {i + 1}: {sum(part) / len(part):.3f}")
+    print(f"\nround trip identical: {restored == data}")
+    assert restored == data
+
+    # --- Things to try ---
+    # 1. Set REPLAY = 0. How much does re-studying help, compared with rung 3?
+    # 2. Try LR = 3e-2 and 3e-4. Which side overshoots, and which learns too slowly?
+    # 3. Set CTX = 4 (and N_HEAD = 1). Attention now sees about what rung 3 saw. Does
+    #    the Transformer's extra machinery still help?
+    # 4. Set N_BYTES = None. Does the full file land closer to rung 2's 2.652?
+    # 5. Read the learning curve against the rung-2 note "context helps, then runs
+    #    out": what would tufazip's pretrained weights.bin do to quarter 1?
+
+
+if __name__ == "__main__":
+    main()
