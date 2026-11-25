@@ -4,14 +4,15 @@ A guided read of the real tufazip model and codec. It assumes you have run (or a
 skimmed) the exercises, especially `04_tiny_transformer.py`, which is this file's model
 shrunk down. Line numbers refer to `nn.py` as of this fork's `master`.
 
-**Status: Parts A, B and C of D are written.** The file is 1,738 lines, so the guide is split:
+**Status: Parts A, B, C and D1 are written; D2 remains.** The file is 1,738 lines, so the guide is split:
 
 | Part | Lines | What it covers | Status |
 |---|---|---|---|
 | **A** | 1-120, 122-336 | Imports, config, benchmark helpers, **the model** | written (below) |
 | **B** | 339-640 | The packed-weights loader (`weights.bin`) | written (below) |
 | **C** | 641-855 | Helpers: LR schedules, frequency table, CLI arguments | written (below) |
-| D | 859-1737 | `main()`: the online encode/decode loop, retraining, checkpoints | not yet written |
+| **D1** | 859-1254, 1429-1574 | `main()`: setup, then **the core online encode/decode loop** | written (below) |
+| D2 | 1255-1427, 1577-1737 | `main()`: `retrain`, checkpoints and requeues, the finish | not yet written |
 
 Where Part A touches something that only `main()` can settle, it says so instead of
 guessing.
@@ -275,8 +276,9 @@ Line 189 is the call that `attention_by_hand.py` checks against PyTorch: scores,
 scaling by `sqrt(d_head)`, the causal mask (`is_causal=True`) and softmax, in one
 fused function. **New compared with the rungs:** `dropout_p` randomly zeroes some
 attention weights, but only when `self.training` is true. `V2_CONFIG` has `dropout: 0.25`,
-so whether the real codec runs in training mode is something `main()` has to settle.
-I'll mark it in Part D rather than assume.
+but `main()` keeps the model in **eval mode while coding** and switches to training
+mode only during retraining (Part D1), so dropout is active only in the retraining
+passes.
 
 Lines 192-215 are the `learned_relative` alternative, not covered here.
 
@@ -614,9 +616,9 @@ function and the model initially behaves like the shallow one. This path is not 
 
 **5. Return an identity record (lines 613-623):** archive size and SHA-256, vocabulary
 SHA-256, kind, source depth, mapping, schedule, and `initial_state_sha256`: the hash of
-the whole model right after loading. (I haven't yet read how `main()` uses this
-record; Part D will say. `validate_checkpoint_prior`, below, consumes the two archive
-digests.)
+the whole model right after loading. `main()` logs these values (lines 1045-1054) and
+stores the two archive digests in every checkpoint, where `validate_checkpoint_prior`
+(below) checks them on resume.
 
 ## `validate_checkpoint_prior` (lines 626-638)
 
@@ -646,7 +648,9 @@ weights.bin (4.3 MB)
 12-block full-precision model would be hundreds of megabytes. Shipping a 2-block,
 1-bit version (4.3 MB) and expanding it at load time keeps the shipped size small. The
 price is a rougher starting point, which the online learning has to make up.
-(That is my reading of the design; the file itself only states the mechanism.)
+(The accounting half is confirmed in Part D1: `main()` zips `weights.bin` together with
+the code and charges it to the benchmark total. Why it was designed this way is my
+reading; the file itself only states the mechanism.)
 
 ---
 
@@ -691,9 +695,9 @@ to `min_lr`. The cosine is a smooth curve from 1 to 0: `0.5 * (1 + cos(pi * prog
 is 1 at the start (`progress = 0`), 0.5 in the middle, 0 at the end.
 
 With the real settings (`lr = 4e-5`, `warmup = 200`; assuming `min_lr = lr x
-min_lr_ratio = 1e-5`, which `main()` should confirm; and an **illustrative**
-`total_steps = 10,000`, since the real value is computed in `main()`), I ran the
-function:
+min_lr_ratio = 1e-5` (confirmed at line 1209); and an **illustrative**
+`total_steps = 10,000`, since the real value is `file_len // batch_size`, line 1208),
+I ran the function:
 
 | step | lr |
 |---|---|
@@ -798,7 +802,7 @@ the vocabulary and prior at `enwik9.voc` and `weights.bin` next to the script. S
 | `--raw_bytes` | Original file size, enabling **bits/byte** logging (the enwik benchmark's metric) |
 | `--vocab_bytes` | "serialized vocabulary size for separate benchmark-total metrics" |
 | `--vocab_file` | Vocabulary whose SHA-256 a `QPI1` prior pins (Part B) |
-| `--initial_prior` | "**transmitted** QPI1 shallow-model initialization archive" (`weights.bin`). The word *transmitted* suggests it is counted as part of what is shipped, but this walkthrough hasn't confirmed how the benchmark total treats it; Part D should say |
+| `--initial_prior` | "**transmitted** QPI1 shallow-model initialization archive" (`weights.bin`). **Confirmed in Part D1:** it is zipped together with the code and charged to the benchmark total |
 | `--external_decompressor_bytes` | For non-Transformer backends only: bytes of external runtime dependencies; "-1 = unaccounted" |
 
 **Model** (real values are in `V2_CONFIG`; see Part A)
@@ -869,8 +873,10 @@ tokens, so both can re-study them without any extra information.
 
 The `--distributed` line is the most important one for anyone hoping to reproduce this:
 the **number of GPUs is itself part of the algorithm**: the help text says "world size
-is part of the codec and must match on decode/resume". The likely reason (my inference;
-Part D should confirm) is that distributed training splits the batch across processes and
+is part of the codec and must match on decode/resume". Part D1 confirms one concrete
+reason: each rank reseeds its random generators with `seed + rank`, so the dropout
+masks used in retraining depend on the number of ranks. A second, probable reason (my
+inference) is that distributed training splits the batch across processes and
 combines their gradients, which changes the order of floating-point additions, so a
 different world size would give slightly different numbers than the encoder had. That is
 why `nn.py`'s docstring points to the README's "two-B200 hardware" requirement, not just
@@ -894,7 +900,7 @@ settings.**
 | Gradient clip | 1.0 | 0.25 |
 | Online LR | 3e-3, constant | 4e-5 peak, warmup then cosine to 1e-5 |
 | Replay | 2 random earlier windows per byte | **every 500,000 tokens: re-train on up to 35M trailing tokens** at a decaying LR |
-| Dropout | none | 0.25 |
+| Dropout | none | 0.25, but **only during retraining** (coding runs in eval mode) |
 | Number format | float32 | bf16 |
 | GPUs | 1 CPU thread | 2 GPUs, and the count is part of the codec |
 
@@ -906,4 +912,405 @@ for a tiny model, but it is not what the real codec does.
 
 ---
 
-*Part D follows once Part C is reviewed.*
+---
+
+# Part D1: `main()`, setup and the core coding loop (lines 859-1254, 1429-1574)
+
+`main()` is 880 lines and nearly half the file. It does one job, the same one every
+rung did: **predict, code, learn, repeat.** Most of its length is infrastructure
+(two GPUs, resumable checkpoints, logging). D1 covers the setup and then the loop that
+*is* the codec. D2 covers `retrain`, checkpoints and the finish.
+
+**If you read only one thing in this file, read "The core loop" below** and compare it
+with `encode()` in `04_tiny_transformer.py`. They are the same shape.
+
+## Setup, in order
+
+### 1. Validate the arguments (lines 860-880)
+
+A run of `if ... raise ValueError(...)` checks. The ones that tell you something:
+`--project_only_targets` requires `--online_loss code` (the head can only be sliced when
+training targets one position); the early-replay pair must both be set or both be 0;
+`--initial_prior` is Transformer-only and the file must exist. These fail fast, before
+any GPU time is spent.
+
+### 2. Devices and ranks (lines 882-914)
+
+- `WORLD_SIZE` is set by `torchrun`. More than one process **requires** `--distributed`.
+- `--distributed` requires CUDA and at least two ranks. It initializes **NCCL** (the
+  GPU-to-GPU communication library), reads `rank` and `LOCAL_RANK`, and pins each
+  process to its own GPU.
+- Otherwise: one process, on CUDA if present, else CPU (or `--cpu`).
+- `is_main = rank == 0`. Many things (logging, the arithmetic coder, file writes) happen
+  **only on rank 0**.
+- `amp_enabled`: bf16 "autocast" is on only on CUDA with `--dtype bf16`. Inside it,
+  matrix maths run in bf16, with the precision-sensitive bits (like `RMSNorm`'s
+  float32 upcast from Part A) protected.
+
+### 3. Determinism (lines 910-914)
+
+```python
+torch.use_deterministic_algorithms(True)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+if device.type == "cuda":
+    torch.cuda.manual_seed_all(args.seed)
+```
+
+`use_deterministic_algorithms(True)` makes PyTorch **raise an error** rather than use any
+operation that isn't bit-for-bit repeatable. With `CUBLAS_WORKSPACE_CONFIG` (Part A,
+line 9), this is the code's answer to "the decoder must make the same floats".
+Everything random is seeded from `seed = 1111`.
+
+### 4. Run directory and logging (lines 916-946)
+
+A run directory is named from a timestamp plus the key settings. Under `--distributed`,
+rank 0 picks the name and **broadcasts it** so every rank agrees, then all wait at a
+`barrier`. `log()` prints and appends to `log.txt`, **on rank 0 only**. The TensorBoard
+writer is a real `SummaryWriter` on rank 0 and a `NullSummaryWriter` (Part C) elsewhere,
+which confirms what Part C guessed.
+
+### 5. Build the model, then load the prior (lines 948-994)
+
+```python
+model = Transformer(
+    args.vocab_size, args.n_layer, args.d_model, args.n_head,
+    args.d_inner, args.ctx_len, args.dropout,
+    tie_emb=not args.untie_embeddings,
+    position_type=args.position_type,
+    qk_norm=not args.no_qk_norm,
+    norm_style=args.norm_style)
+```
+
+This is Part A's `Transformer`, built from the (V2) arguments. Facts this settles:
+
+- **Embeddings are untied**: `tie_emb=not args.untie_embeddings` and V2 sets
+  `untie_embeddings=True`. (Confirmed, closing the question from Part A.)
+- **No `block_schedule` is passed**, so the default `range(n_layer)` applies: each of the
+  12 blocks runs once.
+- The other branches (lines 957-981) build Mamba or KDA models from files that aren't in
+  this repository.
+
+Then the prior (lines 982-990):
+
+```python
+expected_geometry = transformer_geometry(..., not args.untie_embeddings, ...)
+prior_info = load_depth_prior(model, args.initial_prior, args.vocab_file,
+                              expected_geometry, args.seed)
+```
+
+`load_depth_prior` (Part B) overwrites the random initialization with the expanded
+`weights.bin`, on the CPU, **before** the model moves to the GPU (line 991). The
+geometry is built from the *current arguments*, so any mismatch with the archive (say, a
+different `d_model`) raises an error here.
+
+```python
+model_core = model.to(device)
+# Gradients work in eval mode. Keeping online coding in eval mode lets a
+# matched profile enable dropout only during prefix retraining, as NNCP does.
+model_core.eval()
+```
+
+**This answers the dropout question from Part A.** Coding runs in **eval mode**, so
+dropout is **off** while coding; `retrain` (D2) switches to `model.train()`, turns
+dropout on for its passes, and switches back. PyTorch computes gradients fine in eval
+mode, which is why online learning still works. The comment says this mirrors NNCP.
+
+### 6. Wrap in DistributedDataParallel (lines 995-1006)
+
+```python
+model = DistributedDataParallel(model_core, device_ids=[local_rank],
+                                output_device=local_rank, broadcast_buffers=False)
+np.random.seed(args.seed + rank)
+torch.manual_seed(args.seed + rank)
+torch.cuda.manual_seed(args.seed + rank)
+```
+
+DDP is PyTorch's "several GPUs, one model" wrapper: each GPU processes part of the batch,
+and the gradients are averaged between them so all copies stay identical. The key detail
+is the **reseeding**. The comment explains: initialization has to be identical on every
+rank *before* DDP synchronizes, then each rank gets its own stream `seed + rank`, "so
+replay dropout [is] independent while remaining exactly reproducible on encode, decode,
+and resume." That is a concrete reason **the number of ranks is part of the codec**: the
+dropout masks used in retraining are a function of the rank layout.
+
+### 7. Two optimizers (lines 1007-1013)
+
+```python
+optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
+                             betas=(args.beta1, args.beta2), eps=args.adam_eps)
+# separate optimizer so retrain's Adam moments don't perturb the online-coding ones
+retrain_optimizer = torch.optim.Adam(model.parameters(),
+                                     lr=retrain_lr_schedule[0][1],
+                                     betas=(args.beta1, args.beta2), eps=args.adam_eps)
+```
+
+Adam (not AdamW) with `betas = (0.0, 0.9999)` and `eps = 1e-9`, as Part C's table
+said. There are **two** optimizers over the same weights: one for the online coding steps
+and one for retraining. Adam keeps running statistics about past gradients; keeping them
+separate stops retraining's statistics from contaminating the online ones. (The comment
+at line 1009 says exactly this.)
+
+### 8. Logging the model size (lines 1015-1026)
+
+`n_params` counts `model_core.parameters()`, and `emb_params` counts `tok_emb` plus
+`head` only if they are not the same tensor. By the arithmetic in Part A the log should
+say 162,585,600 parameters (154,194,944 non-embedding). That is arithmetic, not a log I
+have seen: the real model is never run in this fork.
+
+### 9. Benchmark accounting (lines 1027-1065)
+
+This **answers the open question from Parts A-C: does `weights.bin` count?** Yes.
+
+```python
+base_decompressor_bytes = decompressor_zip_size(base_dfiles)             # code only
+local_decompressor_bytes = decompressor_zip_size(dfiles, extra_files=(args.initial_prior,))
+prior_transmission_bytes = local_decompressor_bytes - base_decompressor_bytes
+```
+
+The zip of the decompressor's code (`nn.py`, `arithmetic_coder.py`, `checkpoint_utils.py`,
+`preprocess.c`; from Part A's `decompressor_files`) is measured once without and once
+**with `weights.bin` added**, at DEFLATE level 9. The difference is the prior's cost:
+`prior_transmission_bytes`. My expectation (not measured) is that 1-bit sign data is close to random, so DEFLATE
+shrinks it little and the prior costs roughly its raw 4.3 MB.
+
+The final score (D2) is: **compressed payload + vocabulary size + zipped decompressor
+(with prior)**. For Transformers `dependency_accounted` is always true; Mamba and KDA
+runs print a warning that their runtime isn't charged.
+
+### 10. The checkpoint signature (lines 1067-1100)
+
+`config_signature(args, excluded=...)` makes a fingerprint of the settings (by its name
+and use, a hash; I haven't read its code) **that affect predictions**. The `excluded` set lists what does *not*: input and output paths, log and
+run directories, checkpoint settings, and accounting. The comments explain two:
+paths may differ between encoder and decoder machines ("QPI1 contents are pinned
+separately by the archive and vocabulary SHA-256 values"), and a few newer options are
+stored separately so older checkpoints stay resumable. The function itself lives in
+`checkpoint_utils.py`, which this walkthrough doesn't cover.
+
+### 11. Resuming (lines 1101-1133)
+
+If `--checkpoint_dir` has a saved checkpoint, `main()` refuses to continue unless **every**
+one of these matches: checkpoint version, config signature, target-projection mode,
+early-replay policy, input file size, **world size**, and the prior's two digests
+(`validate_checkpoint_prior`, Part B). Only then does it load the model weights **and
+both optimizers' states**. This is Part A's determinism theme applied to resuming a
+multi-day job.
+
+### 12. Input and output files, and the arithmetic coder (lines 1135-1200)
+
+**Encoding:**
+
+```python
+file_data = load_tokens(args.input).copy()            # the whole token array
+out_file.write(original_len.to_bytes(4, byteorder="big"))   # 4-byte token count
+bit_out = BitOutputStream(out_file)
+encoder = ArithmeticEncoder(32, bit_out)              # 32-bit coder, as in the rungs
+```
+
+The same arrangement as every rung: a **4-byte big-endian count** first (so the decoder
+knows when to stop), then the arithmetic coder. Only rank 0 owns the file and the coder.
+
+**Decoding:** read the 4-byte count, set up an `ArithmeticDecoder`, and create
+`file_data = np.zeros(original_len)`, to be **filled in as tokens are decoded**.
+Under `--distributed`, rank 0 broadcasts the length to the other ranks. (The
+`decoded_prefix` code is only for resuming, which D2 covers.)
+
+### 13. Padding, blocks and streams (lines 1202-1213)
+
+```python
+file_len = ((original_len + batch - 1) // batch) * batch     # round up to a multiple of 64
+block_len = max(batch, (args.block_len // batch) * batch)    # 499,968 for V2
+total_steps = file_len // batch
+min_lr = args.lr * args.min_lr_ratio                         # 1e-5 for V2
+```
+
+- The token array is **padded with zeros** up to a multiple of `batch_size` (64). Those
+  few extra tokens are coded too; the decoder writes only `original_len` tokens back out.
+- A **block** is 500,000 tokens rounded down to a multiple of 64: **499,968**.
+- `total_steps = file_len // 64` is the count of online learning steps; it's what
+  `lr_at` (Part C) uses to place the end of the cosine, and `min_lr = lr * min_lr_ratio`
+  confirms the assumption made in Part C.
+
+**What the "64 streams" means is the one idea you need for the loop.** Each block is
+cut into **64 consecutive pieces**, `block_stride = 499,968 / 64 = 7,812` tokens each.
+The model reads those 64 pieces **in parallel**, one token at a time:
+
+```
+block (499,968 tokens)
+  |-- stream 0:  tokens [        0 ..  7,811]
+  |-- stream 1:  tokens [    7,812 .. 15,623]
+  |-- stream 2:  ...
+  |-- stream 63: ...
+
+step t:  predict token t of ALL 64 streams in one batch,
+         code them one after another, then learn from all 64 at once
+```
+
+So the model is effectively reading **64 different passages of text at the same time**.
+Each stream's context is **only its own earlier tokens** (never another stream's), and
+it starts fresh at the top of each block.
+
+*Why do it this way? (my reading; the code only says "streams are batched within a
+block")* A GPU is far more efficient doing 64 predictions in one go than 64 predictions
+one at a time. The price is that a stream can't see the text just before its start,
+which costs a little compression.
+
+### 14. Splitting the batch across GPUs (lines 1231-1250)
+
+`batch` and `retrain_batch` must be divisible by `world_size`. With 2 ranks, each GPU
+takes **32 of the 64 streams** (`local_batch`, `local_batch_start`, `local_batch_end`).
+
+---
+
+## The core loop (lines 1429-1574)
+
+This is the part to compare with the rungs. Here is the skeleton, then each piece.
+
+```python
+while block_start < file_len:                    # one pass per 499,968-token block
+    if retrain is due: retrain(...)              # D2
+    block_stride = cur_block_len // batch        # 7,812
+    for stream_pos in range(block_stride):       # one step: one token from each of 64 streams
+        ...build the input...
+        ...forward pass...
+        ...arithmetic-code 64 symbols...
+        ...learn from them...
+    ...write the block (decode), maybe checkpoint (D2)...
+```
+
+### Step 1: build the input (lines 1439-1446)
+
+```python
+window = min(stream_pos, ctx_len)
+if window == 0:
+    inp = np.zeros((local_batch, 1), dtype=np.int64)   # dummy BOS for the first token
+else:
+    offsets = stream_pos - window + np.arange(window)
+    inp = file_data[stream_base[:, None] + offsets[None, :]]
+```
+
+For each stream: the **previous `window` tokens**, at most `ctx_len = 192`. At the very
+first position there is nothing before it, so the input is a single dummy token `0`, the
+same start-of-text trick my rung 4 used (`BOS = 0`). The input is
+`[local_batch, window]`: the model sees the context **before** the token it is about to
+code, never the token itself.
+
+### Step 2: set the learning rate (lines 1448-1450)
+
+`lr_at(train_step, args.lr, min_lr, args.warmup, total_steps)` from Part C, written
+into the optimizer **before every step**. (In the code, one training step is one 64-token
+step through the loop.)
+
+### Step 3: forward pass (lines 1452-1459)
+
+```python
+with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+    if args.project_only_targets:
+        logits = model(inp_t, output_positions=slice(-1, None))
+    else:
+        logits = model(inp_t)
+code_logits = logits[:, -1, :].float()
+```
+
+`slice(-1, None)` is the `output_positions` option from Part A: **project only the last
+position** through the 4,097-way head. The newest position's logits predict the next
+token; they are converted to float32 (`.float()`) for the coding step.
+
+### Step 4: arithmetic-code the 64 symbols (lines 1461-1481)
+
+```python
+if is_main:
+    freq = make_freq_table(global_code_logits)       # Part C
+    for i in range(batch):                           # 64 symbols, one at a time
+        if decode:
+            file_data[global_code_pos[i]] = decoder.read(freq[i])
+        else:
+            encoder.write(freq[i], int(file_data[global_code_pos[i]]))
+```
+
+- Under `--distributed`, each rank's logits are first **gathered onto rank 0**
+  (`dist.gather`), because there is **one** arithmetic coder and it lives on rank 0.
+- `make_freq_table` turns the `[64, 4097]` logits into 64 cumulative tables.
+- Then a plain Python `for` loop codes (or decodes) the 64 symbols **in order**.
+  Compare with the rungs: `encoder.write(freqs, byte)` and `decoder.read(freqs)`. It is
+  the same call, 64 times per step.
+- This single-threaded, pure-Python loop is the bottleneck the `--ctx_len` comment in Part
+  C pointed at: the GPUs wait while one process does arithmetic.
+
+**Why interleaving 64 streams is safe for decoding:** at step `t`, every stream's
+prediction depends only on *earlier* steps, so the decoder can compute all 64
+predictions before decoding any of the 64 symbols, and decode them in the same order
+the encoder wrote them.
+
+### Step 5: the targets (lines 1483-1495)
+
+When encoding, the targets are simply `file_data[code_pos]`. When decoding they are the
+symbols just decoded. Under `--distributed`, rank 0 **broadcasts** the freshly decoded
+tokens to the other rank (lines 1483-1493), since only rank 0 ran the decoder but both
+ranks need the targets to learn from.
+
+### Step 6: count the bits (lines 1497-1503)
+
+```python
+code_nats = F.cross_entropy(code_logits, code_targets, reduction="sum").detach()
+...
+n_bits += code_nats.item() / LOG2
+n_symbols += batch
+```
+
+The cost of a token is `-ln P(token)` ("nats"); dividing by `LOG2` gives bits. This is
+the same "size ~ sum of -log2(p)" idea from your session 1 notes. It is the **model's
+own estimate**; the true compressed size is measured at the end (D2) from the actual
+file, and the two should agree to within a few bytes.
+
+### Step 7: learn (lines 1505-1523)
+
+```python
+if args.online_loss == "code":
+    loss = F.cross_entropy(code_logits, code_targets)     # mean over the 64 new targets
+else:
+    ...legacy: every position in the window...
+optimizer.zero_grad(set_to_none=True)
+loss.backward()
+grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)   # 0.25
+optimizer.step()
+train_step += 1
+```
+
+With V2's `online_loss = 'code'`, the loss is **only on the 64 tokens just coded** (the
+comment: "trains only the new symbol, like NNCP v2, so each online target has
+approximately equal exposure"). Then: backpropagate, clip the gradient to norm 0.25, one
+Adam step. **One optimizer step per 64 coded tokens.** The decoder repeats exactly this
+after decoding the same 64 tokens, so both sides' weights stay identical.
+
+### Step 8: log, and write the block (lines 1527-1574)
+
+Every `log_interval` symbols (100,000) it prints a row and writes TensorBoard scalars.
+The columns (set up at lines 1426-1428) are step, symbols so far, compressed bytes so
+far (`n_bits / 8`), bits per token and bits per byte (local to the interval, and
+cumulative), throughput in kilo-symbols per second, and the learning rate.
+`bpb_cum` is the headline number, **comparable with the "bits/byte" in your rung table**
+(it is `bits per token / bytes per token`, using the whole file's average token length;
+the bits/byte columns print `nan` unless `--raw_bytes` is given).
+
+When decoding, at the end of each block, rank 0 writes the block's tokens to the output
+file as big-endian 16-bit numbers (the same format `load_tokens` reads, Part C).
+
+---
+
+## Rung 4's loop next to the real one
+
+| | `04_tiny_transformer.py` `encode()` | `nn.py` `main()` loop |
+|---|---|---|
+| Unit of work | **one** byte | **64** tokens (one from each of 64 streams) |
+| Context | last 32 bytes, with a start marker | last 192 tokens of the *same stream*, with a start marker |
+| Predict | `model.predict(history)` | `model(inp)`, project the last position, `.float()` |
+| Frequency table | `to_freqs(p)` (NumPy) | `make_freq_table(logits)` (PyTorch), one row per stream |
+| Code | `encoder.write(freqs, byte)` | the same call, 64 times, in a Python loop on rank 0 |
+| Cost accounting | `-log2` of the integer slice | cross-entropy in nats, divided by `LOG2` |
+| Learn | all window positions, 1 Adam step per byte, then 2 replays | **new targets only**, 1 Adam step per 64 tokens, **plus** big retrain passes at block ends (D2) |
+| Mode | default (train) | **eval** while coding; train only in retraining |
+| Determinism | same container, 1 thread | `use_deterministic_algorithms`, fixed seeds per rank, same GPU layout |
+
+*Part D2 follows once D1 is reviewed: `retrain`, checkpoints and requeues, and the finish.*
