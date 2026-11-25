@@ -1,0 +1,213 @@
+"""Rung 4 (Part 1): a tiny causal Transformer, mirroring nn.py.
+
+Same pipeline as rungs 1-3. Only the thing that produces the probabilities changes.
+Rung 3 saw the last 3 bytes as one fixed bundle. Here attention lets every position
+look back over up to CTX bytes and choose how much to listen to each (the five steps
+in attention_by_hand.py), and a stack of blocks refines that.
+
+    bytes -> tok_emb + pos_emb
+          -> [ RMSNorm -> Attention (+residual) -> RMSNorm -> SwiGLU (+residual) ]
+          -> RMSNorm -> head -> 256 logits -> softmax -> P(next byte)
+
+This file is nn.py shrunk down:
+
+                     nn.py (V2)      here
+    vocabulary       word tokens     256 bytes
+    layers           12              1
+    d_model          1024            64
+    heads            8               4
+    context          192 tokens      32 bytes
+
+Left out on purpose (stability tricks that only matter at 12 layers): QK-norm,
+"peri" norm placement, block_schedule, learned_relative attention.
+One deliberate difference: nn.py uses RoPE to tell the model about order; here a
+plain learned position embedding does the same job and is easier to read. RoPE is
+covered in docs/NN_WALKTHROUGH.md.
+
+PART 1 (this part): the model classes, plus two checks.
+PART 2 (next): the encoder/decoder loop that turns these probabilities into bits.
+
+Run (from the repo root):
+    docker run --rm -v "$PWD":/work tufazip-learn python exercises/04_tiny_transformer.py
+"""
+import math
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+ROOT = Path(__file__).resolve().parent.parent
+
+VOCAB = 256     # one entry per possible byte
+CTX = 32        # how many previous bytes attention can look back over
+D_MODEL = 64    # width of the vector each position carries (nn.py: 1024)
+N_HEAD = 4      # attention heads side by side (nn.py: 8)
+D_INNER = 176   # SwiGLU hidden width: ~8/3 * D_MODEL rounded to a multiple of 16
+                # (nn.py's comment at line ~747 explains the 8/3: SwiGLU has 3
+                # matrices where a plain ReLU feed-forward has 2)
+
+
+# ---------------------------------------------------------------------------
+# The model. Shapes in comments: B = batch, T = sequence length, D = D_MODEL.
+# ---------------------------------------------------------------------------
+class RMSNorm(nn.Module):
+    """Rescale each position's vector so its average square is 1, then apply a
+    learned per-number gain. Keeps numbers from drifting huge or tiny as they pass
+    through layers. (nn.py line 125; identical.)"""
+
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        var = x.pow(2).mean(-1, keepdim=True)          # mean of squares, per position
+        return x * torch.rsqrt(var + self.eps) * self.weight
+
+
+class Attention(nn.Module):
+    """Steps 1-5 of attention_by_hand.py, run by N_HEAD heads at once."""
+
+    def __init__(self, d_model, n_head):
+        super().__init__()
+        assert d_model % n_head == 0, "d_model must be divisible by n_head"
+        self.n_head = n_head
+        self.d_head = d_model // n_head
+        # One matrix makes q, k and v for every head at once: D -> 3*D.
+        # In attention_by_hand.py we wrote q, k, v down by hand; this is where a
+        # real model gets them. (nn.py line 162.)
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        # Mixes the heads' outputs back into one D-sized vector. (nn.py line 163.)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x):                                # x: [B, T, D]
+        B, T, D = x.shape
+        q, k, v = self.qkv(x).split(D, dim=2)            # each [B, T, D]
+        # Cut D into N_HEAD slices of d_head, and move heads next to the batch so each
+        # head does its own attention: [B, T, D] -> [B, N_HEAD, T, d_head].
+        q = q.view(B, T, self.n_head, self.d_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.d_head).transpose(1, 2)
+        # Scores (Q @ K.T), scaling by sqrt(d_head), causal mask, softmax, weights @ V:
+        # the whole of attention_by_hand.py Steps 1-5 in one call. (nn.py line 189.)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = out.transpose(1, 2).contiguous().view(B, T, D)  # glue the heads back
+        return self.proj(out)
+
+
+class SwiGLU(nn.Module):
+    """The per-position "thinking" step. Attention moves information BETWEEN
+    positions; this transforms it WITHIN each position. (nn.py line 220; identical.)
+
+    gate and up both widen D -> D_INNER. silu(gate) acts as a soft on/off switch on
+    `up`, element by element; down narrows back to D."""
+
+    def __init__(self, d_model, d_inner):
+        super().__init__()
+        self.gate = nn.Linear(d_model, d_inner, bias=False)
+        self.up = nn.Linear(d_model, d_inner, bias=False)
+        self.down = nn.Linear(d_inner, d_model, bias=False)
+
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+class Block(nn.Module):
+    """Attention then SwiGLU, each with a residual connection (`x = x + ...`): the
+    layer adds a correction to what was already there instead of replacing it, so
+    information (and gradients) can flow straight through many layers."""
+
+    def __init__(self, d_model, n_head, d_inner):
+        super().__init__()
+        self.attn_norm = RMSNorm(d_model)
+        self.attn = Attention(d_model, n_head)
+        self.ffn_norm = RMSNorm(d_model)
+        self.ffn = SwiGLU(d_model, d_inner)
+
+    def forward(self, x):
+        x = x + self.attn(self.attn_norm(x))
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+
+class TinyTransformer(nn.Module):
+    def __init__(self, vocab=VOCAB, n_layer=1, d_model=D_MODEL, n_head=N_HEAD,
+                 d_inner=D_INNER, ctx=CTX):
+        super().__init__()
+        self.tok_emb = nn.Embedding(vocab, d_model)   # byte -> vector (rung 3's E)
+        # Attention cannot tell "ab" from "ba" by itself (it is a weighted average,
+        # and averages ignore order), so we add a learned vector per position.
+        self.pos_emb = nn.Embedding(ctx, d_model)
+        self.blocks = nn.ModuleList(
+            [Block(d_model, n_head, d_inner) for _ in range(n_layer)])
+        self.norm = RMSNorm(d_model)
+        self.head = nn.Linear(d_model, vocab, bias=False)
+        # Tie input and output embeddings (nn.py line 295): the vector that
+        # represents byte 'e' going in is the one scored against coming out.
+        # Halves those parameters and ties "what e means" to "when e comes next".
+        # (nn.py supports this, but V2_CONFIG sets untie_embeddings=True: with a
+        # 4097-word vocabulary and 1024 wide vectors it pays for separate ones.
+        # With only 256 bytes, tying is the better trade.)
+        self.head.weight = self.tok_emb.weight
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module):
+        # Small starting weights: all 256 logits start nearly equal, so the
+        # untrained model predicts nearly uniformly (nn.py line 313).
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx):                           # idx: [B, T] ints in 0..255
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device)
+        x = self.tok_emb(idx) + self.pos_emb(pos)     # [B, T, D]
+        for block in self.blocks:
+            x = block(x)
+        return self.head(self.norm(x))                # [B, T, VOCAB] logits
+
+
+# ---------------------------------------------------------------------------
+# Part 1 checks: does the model have the shape and behaviour we claim?
+# ---------------------------------------------------------------------------
+def bits_per_byte(model, idx):
+    """Average -log2 P(true next byte) over every position of `idx` ([B, T])."""
+    logits = model(idx[:, :-1])                       # predict byte t+1 from bytes 0..t
+    nats = F.cross_entropy(logits.reshape(-1, VOCAB), idx[:, 1:].reshape(-1))
+    return nats.item() / math.log(2)                  # nats -> bits
+
+
+def part1_checks():
+    torch.manual_seed(0)
+    model = TinyTransformer().eval()
+    data = (ROOT / "exercises" / "sample.txt").read_bytes()
+    idx = torch.tensor(list(data[:CTX]), dtype=torch.long)[None]   # [1, CTX]
+
+    n_params = sum(p.numel() for p in model.parameters())  # tied weight counted once
+    print(f"parameters: {n_params:,}   (nn.py V2 is ~160 million)")
+
+    logits = model(idx)
+    print(f"input {tuple(idx.shape)} -> logits {tuple(logits.shape)}"
+          f"   (one 256-way prediction per position)")
+
+    # CHECK 1: untrained model ~ uniform, so ~log2(256) = 8 bits/byte.
+    bpb = bits_per_byte(model, idx)
+    print(f"untrained bits/byte: {bpb:.3f}   (uniform guessing = {math.log2(VOCAB):.3f})")
+    assert abs(bpb - 8.0) < 0.1
+
+    # CHECK 2: causal mask. Change the LAST byte; every earlier position's logits
+    # must be untouched, since they may not see the future.
+    changed = idx.clone()
+    changed[0, -1] = (changed[0, -1] + 1) % VOCAB
+    with torch.no_grad():
+        a, b = model(idx), model(changed)
+    same_before = torch.allclose(a[:, :-1], b[:, :-1])
+    moved_last = not torch.allclose(a[:, -1], b[:, -1])
+    print(f"causal: earlier positions unchanged = {same_before}, "
+          f"last position moved = {moved_last}")
+    assert same_before and moved_last
+
+
+if __name__ == "__main__":
+    part1_checks()
