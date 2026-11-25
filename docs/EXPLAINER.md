@@ -111,8 +111,12 @@ clever closes the gap fast."** That is a measured trend, not a measured winner.
 
 The real program faces the same start-up problem, so it doesn't start from nothing.
 
-- It **ships with a pre-taught brain** (a 4.3 MB file of "starting knowledge"). That
-  removes most of the slow beginning we saw above.
+- It **ships with a head start**: a 4.3 MB file of "starting knowledge", stored in a very
+  rough, shrunk-down form (a small model that is expanded into the full-size one). That
+  shortens the slow beginning we saw above, though we haven't measured by how much.
+- It **keeps re-reading what it has already coded**: every half-million word-pieces or
+  so, it studies its own earlier output again. The decoder has the same text, so it can
+  repeat this exactly. (Our toy does a miniature version of this.)
 - Its job is **enormous**: 1 GB of text, so a learner has plenty of time to pay off.
 - Its brain is far bigger: about **160 million** adjustable numbers, against about
   **69 thousand** in our Transformer.

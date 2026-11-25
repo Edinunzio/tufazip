@@ -19,7 +19,7 @@ in plain language.
    printed. Read it between rungs 3 and 4.
 4. `exercises/05_sample_size.py`: how the rungs compare as the input shrinks.
 5. `nn.py` (the real model). Rung 4 deliberately mirrors it; see "Map to nn.py" below.
-   A line-by-line guide (`NN_WALKTHROUGH.md`) is planned but not written yet.
+   The line-by-line guide is [NN_WALKTHROUGH.md](NN_WALKTHROUGH.md).
 
 ## Quick start
 
@@ -90,8 +90,11 @@ What it does **not** support:
 - The order-5 table trailing order 3 by ~0.11-0.14 at every size is measured, but the
   "sparse tables" explanation for it is not shown by this data.
 
-Why this matters for the real model: tufazip avoids the start-up cost by shipping
-**pretrained weights** (`weights.bin`, 4.3 MB) and by working on 1 GB of input.
+Why this matters for the real model: tufazip softens the start-up cost with a **starting
+prior** (`weights.bin`, 4.3 MB: a 2-block model stored at 1 bit per weight and expanded
+to 12 blocks at load time, see NN_WALKTHROUGH Part B), with **retraining** on text it has
+already coded, and by working on 1 GB of input. How much each contributes was not
+measured here.
 
 ## The overall workflow
 
@@ -128,7 +131,7 @@ flowchart TD
         M2["Rung 2: n-gram counts, blended"]
         M3["Rung 3: 3 bytes -> embed -> tanh -> softmax"]
         M4["Rung 4: tok_emb + pos_emb -> Block<br/>(RMSNorm, Attention, SwiGLU, residuals)<br/>-> head -> softmax"]
-        M5["tufazip: same as rung 4, 12 blocks,<br/>word tokens, pretrained weights"]
+        M5["tufazip: same as rung 4, 12 blocks,<br/>word tokens, 1-bit starting prior"]
         M1 --> M2 --> M3 --> M4 --> M5
     end
 
@@ -183,6 +186,24 @@ Left out of rung 4 on purpose: QK-norm, "peri" norm placement, `block_schedule`,
 `learned_relative` attention, dropout, bf16, distributed training, and the retraining
 schedule. `attention_by_hand.py` agrees with PyTorch's attention, the very call in
 `nn.py`.
+
+### The training setup differs too
+
+The architecture maps closely, but the **learning** does not. Read this before comparing
+rung 4's numbers with anything about the real model. (Full detail in
+[NN_WALKTHROUGH.md](NN_WALKTHROUGH.md), Parts C and D.)
+
+| | Rung 4 | `nn.py` (V2 settings) |
+|---|---|---|
+| What one update trains on | every position of the window | **only the newly coded tokens** (`online_loss = 'code'`) |
+| Tokens per update | 1 | 64 (one from each of 64 parallel streams) |
+| Adam momentum `beta1` / `beta2` | 0.9 / 0.999 (defaults) | **0.0** / 0.9999 |
+| Gradient clip | 1.0 | 0.25 |
+| Online learning rate | 3e-3, constant | 4e-5 peak, warmup then cosine to 1e-5 |
+| Replay | 2 random earlier windows per byte | at every 500K-token block, retrain on up to 35M earlier tokens, own optimizer, decaying LR |
+| Dropout | none | 0.25, but **only during retraining** (coding runs in eval mode) |
+| Number format | float32 | bf16 |
+| Hardware | 1 CPU thread | 2 GPUs; the GPU count is itself part of the codec |
 
 ## Repository map
 

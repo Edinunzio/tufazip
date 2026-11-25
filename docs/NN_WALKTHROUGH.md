@@ -4,7 +4,7 @@ A guided read of the real tufazip model and codec. It assumes you have run (or a
 skimmed) the exercises, especially `04_tiny_transformer.py`, which is this file's model
 shrunk down. Line numbers refer to `nn.py` as of this fork's `master`.
 
-**Status: Parts A, B, C and D1 are written; D2 remains.** The file is 1,738 lines, so the guide is split:
+**Status: complete. Parts A, B, C, D1 and D2 are all written.** The file is 1,738 lines, so the guide is split:
 
 | Part | Lines | What it covers | Status |
 |---|---|---|---|
@@ -12,7 +12,7 @@ shrunk down. Line numbers refer to `nn.py` as of this fork's `master`.
 | **B** | 339-640 | The packed-weights loader (`weights.bin`) | written (below) |
 | **C** | 641-855 | Helpers: LR schedules, frequency table, CLI arguments | written (below) |
 | **D1** | 859-1254, 1429-1574 | `main()`: setup, then **the core online encode/decode loop** | written (below) |
-| D2 | 1255-1427, 1577-1737 | `main()`: `retrain`, checkpoints and requeues, the finish | not yet written |
+| **D2** | 1255-1427, 1577-1737 | `main()`: `retrain`, checkpoints and requeues, the finish | written (below) |
 
 Where Part A touches something that only `main()` can settle, it says so instead of
 guessing.
@@ -1080,13 +1080,13 @@ runs print a warning that their runtime isn't charged.
 
 ### 10. The checkpoint signature (lines 1067-1100)
 
-`config_signature(args, excluded=...)` makes a fingerprint of the settings (by its name
-and use, a hash; I haven't read its code) **that affect predictions**. The `excluded` set lists what does *not*: input and output paths, log and
+`config_signature(args, excluded=...)` (in `checkpoint_utils.py`) turns every setting
+**that affects predictions** into one sorted JSON string. It is a plain string, not a
+hash, and resuming requires the saved string to match exactly. The `excluded` set lists what does *not*: input and output paths, log and
 run directories, checkpoint settings, and accounting. The comments explain two:
 paths may differ between encoder and decoder machines ("QPI1 contents are pinned
 separately by the archive and vocabulary SHA-256 values"), and a few newer options are
-stored separately so older checkpoints stay resumable. The function itself lives in
-`checkpoint_utils.py`, which this walkthrough doesn't cover.
+stored separately so older checkpoints stay resumable.
 
 ### 11. Resuming (lines 1101-1133)
 
@@ -1313,4 +1313,283 @@ file as big-endian 16-bit numbers (the same format `load_tokens` reads, Part C).
 | Mode | default (train) | **eval** while coding; train only in retraining |
 | Determinism | same container, 1 thread | `use_deterministic_algorithms`, fixed seeds per rank, same GPU layout |
 
-*Part D2 follows once D1 is reviewed: `retrain`, checkpoints and requeues, and the finish.*
+---
+
+# Part D2: `retrain`, checkpoints and the finish (lines 1255-1427, 1577-1737)
+
+D1 covered the loop that codes tokens. D2 covers the three things around it: the
+big **retraining passes** that happen between blocks, the **checkpoint and restart**
+machinery that lets a multi-day job survive being stopped, and what happens at the end.
+The helpers `main()` uses from `checkpoint_utils.py` (145 lines) are covered here too.
+
+## `retrain(file_data, file_pos)` (lines 1255-1334)
+
+**Why it exists (the docstring):** "Extra training passes over the already-coded prefix
+`file_data[:file_pos]`. Reads only data both sides already hold at this point, so the
+weights it produces are reproducible during decompression and the codec stays valid.
+Runs on a separate optimizer, leaving the online-coding Adam state untouched."
+
+This is the real version of the "replay" in your rungs 3 and 4. Between blocks, both
+sides re-study the text they have already coded, **for free**: the decoder has it too.
+(How much of the final compression this contributes is not something the code states or
+that I have measured.)
+
+It is called at the top of the main loop (lines 1430-1432), whenever
+`block_start - last_retrain_pos >= retrain_period`. With V2's `retrain_period = 1`, that
+means **at every block boundary except the very first** (`block_start = 0`).
+
+### Choosing what to study (lines 1262-1268)
+
+```python
+lo = max(0, file_pos - args.retrain_len)                  # at most 35,000,000 tokens back
+stride = (file_pos - lo) // retrain_batch                 # retrain_batch = 32
+if stride < 2:
+    return                                                # too little text yet
+global_stream_base = lo + retrain_arange_batch * stride
+stream_base = global_stream_base[local_retrain_start:local_retrain_end]
+n_targets = stride - 1
+```
+
+The window `[lo, file_pos)` (the most recent up-to-35M coded tokens) is cut into **32
+equal streams**, each `stride` tokens long. Each stream is a contiguous passage, and
+under `--distributed` each GPU takes half the streams (16 each). `n_targets = stride - 1`
+because the last token of a stream has no "next token" inside it.
+
+### One epoch (lines 1280-1323)
+
+```python
+model.train()                                             # dropout ON
+for epoch in range(retrain_epochs):
+    for start in range(0, n_targets, update_len):         # update_len = 64
+        length = min(update_len, n_targets - start)
+        context_start = max(0, start - (ctx_len - length)) if args.retrain_update_len else start
+        prefix_len = start - context_start
+        cols = context_start + np.arange(prefix_len + length)
+        inp = file_data[stream_base[:, None] + cols[None, :]]
+        tgt = file_data[stream_base[:, None] + (start + np.arange(length))[None, :] + 1]
+```
+
+For each stream, **march along it 64 targets at a time**. Each update feeds the model the
+64 tokens being trained on **plus up to 128 earlier tokens as context** (`ctx_len`
+192 minus 64; `context_start` is that arithmetic). The comment (lines 1284-1285): "Each
+target is optimized exactly once, while earlier known tokens provide up to ctx_len
+positions of conditioning." So every token in the window is a training target **once per
+epoch**, with a full context in front of it.
+
+```python
+target_logits = model(inp_t, output_positions=slice(prefix_len, prefix_len + length))
+loss = F.cross_entropy(target_logits.float().reshape(-1, vocab_size), tgt_t.reshape(-1))
+retrain_optimizer.zero_grad(set_to_none=True)
+loss.backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+current_retrain_lr = piecewise_lr_at(retrain_train_step, retrain_lr_schedule)
+for group in retrain_optimizer.param_groups:
+    group["lr"] = current_retrain_lr
+retrain_optimizer.step()
+retrain_train_step += 1
+```
+
+- `output_positions=slice(prefix_len, prefix_len + length)` is the same "only project
+  the positions we need" idea as the coding loop, but for a **range** instead of the
+  last position. The context positions are used for conditioning and never scored.
+- The loss is cross-entropy on those 64 targets per stream; then the familiar
+  backprop, clip (0.25), and one step of the **separate `retrain_optimizer`** at the
+  rate from Part C's piecewise schedule (indexed by `retrain_train_step`, a counter that
+  keeps growing across all retrains and is saved in checkpoints).
+- **Dropout is on** (`model.train()`) for these passes only. That is the one place
+  `dropout = 0.25` and the per-rank seeding from D1 come into play.
+
+At the end, `model.eval()` restores coding mode (line 1325), the loss is averaged
+across GPUs (`all_reduce`) and logged as an `R ...` line with `bits/tok` over the
+window, plus TensorBoard scalars under `retrain/`.
+
+### How big is one retrain?
+
+Arithmetic from V2's settings, for a **full** 35M-token window and 32 streams:
+`stride = 35,000,000 // 32 = 1,093,750`, so about 1.09 million targets per stream, at 64
+per update gives **about 17,090 optimizer steps per retrain call**. The 500,000-token
+block that triggers it needed only 7,812 online steps. Early in a file the window is
+smaller (the first retrain, at 499,968 tokens, is about 245 steps), and it fills up after
+roughly 70 blocks. This is arithmetic from the arguments, not a measured run.
+
+**Why this is allowed:** every index it reads is below `file_pos`, so it only touches
+tokens the decoder has already produced. Same weights on both sides.
+
+`★` What this means for sample size: by the arithmetic above, the real compressor
+performs **more optimizer steps in each retrain than in the block that triggers it**
+(17,090 vs 7,812 for a full window). It is the same trick as my replay in rung 4,
+scaled up, and it means the model is not one trained once on the data: it keeps
+re-reading its own past.
+
+## Resuming: restoring the counters (lines 1336-1361)
+
+On a fresh run all counters start at zero (`n_symbols`, `n_bits`, `train_step`,
+`block_start`, `last_retrain_pos`). On a resume they come from the checkpoint, and the
+random number generators are restored (`restore_rng_state`), **per rank** when
+distributed (lines 1346-1350). `start_time` is back-dated by the saved
+`elapsed_seconds`, so the throughput numbers ignore time spent waiting in the queue.
+
+## `checkpoint_utils.py`: the helpers `main()` uses
+
+| Helper | What it does |
+|---|---|
+| `atomic_torch_save(value, path)` | Writes to a temporary file, **`fsync`s** it to disk, `os.replace`s it over the real name, then `fsync`s the directory. Retries up to 3 times. A reader can **never see a half-written `latest.pt`**, even if the machine dies mid-save |
+| `capture_rng_state` / `restore_rng_state` | Save and restore Python's, NumPy's, PyTorch's and (if present) every CUDA device's random generator. Needed because dropout in retraining is random, and the decoder must draw the same numbers |
+| `config_signature` | The sorted-JSON settings string used to reject an incompatible resume (D1) |
+| `load_checkpoint` | `torch.load(path, map_location=device, weights_only=False)`. See the note below |
+| `flush_and_sync`, `mark_done`, `stop_requested` | Flush a file to disk; write a `DONE` marker file; and report whether a file named **`STOP_REQUESTED`** exists in the checkpoint directory |
+
+`REQUEUE_EXIT_CODE = 75`.
+
+**A safety note** (since you asked to be told about these): `weights_only=False` means
+loading a checkpoint can run arbitrary Python code embedded in the file (that is how
+`pickle` works). It is fine for checkpoints your own run wrote, but **never resume from
+a checkpoint you didn't create or don't trust.**
+
+## `save_resume_checkpoint(reason)` (lines 1363-1423)
+
+What gets saved, so a restarted job can continue **bit for bit**:
+
+| Saved | Why it is needed |
+|---|---|
+| `model` weights | The learned state |
+| `optimizer` and `retrain_optimizer` states | Adam's running statistics, for both |
+| RNG states (per rank) | Same random draws for dropout after the restart |
+| Arithmetic coder state: **`low`, `high`** (and `num_underflow` when encoding, `code` when decoding) | Everything the coder needs to continue. (This is the "state is just two integers" idea from your rung 1 notes: `arithmetic_coder.py` lines 123-137 and 178-188) |
+| Bit stream state: file position and the partly-filled byte | Where the compressed output stands |
+| For decoding: `output_position` | How much plain output has already been written |
+| Counters: `n_symbols`, `n_bits`, `train_step`, `retrain_train_step`, `block_start`, `last_retrain_pos`, elapsed time | Resume exactly where it stopped |
+| Identity: config string, prior archive and vocabulary SHA-256, world size, input size, `original_len`, `file_len` | Refuse to resume with anything that differs (D1, step 11) |
+
+How it runs: every rank captures its RNG, rank 0 **gathers** them (`dist.gather_object`),
+synchronizes CUDA, then the other ranks wait at a barrier. Rank 0 flushes the output file
+to disk (`flush_and_sync`) **before** writing the checkpoint, so the output and the
+checkpoint agree, then calls `atomic_torch_save`.
+
+**When resuming an encode, the output file is trimmed back to the checkpoint:**
+`BitOutputStream.load_state_dict` does `seek(position)` then `truncate(position)`
+(`arithmetic_coder.py` lines 377-382), discarding anything written after the checkpoint.
+The decode path does the equivalent for its output file (lines 1168-1173). So a crash
+between checkpoints can't leave stray bytes behind.
+
+## The tail of the loop: blocks, checkpoints, stopping (lines 1570-1601)
+
+After each block:
+
+```python
+if decode and is_main:
+    out_file.write(file_data[block_start:end].astype(">u2").tobytes())   # write the block
+block_start += cur_block_len
+completed_blocks += 1
+
+requested_stop = args.checkpoint_dir and stop_requested(args.checkpoint_dir)
+test_stop = args.stop_after_blocks and completed_blocks >= args.stop_after_blocks
+periodic = args.checkpoint_dir and completed_blocks % args.checkpoint_every_blocks == 0
+if block_start < file_len and (periodic or requested_stop or test_stop):
+    save_resume_checkpoint(reason)
+if block_start < file_len and (requested_stop or test_stop):
+    log("stopping cleanly for Slurm requeue")
+    ... close files, tear down the process group ...
+    return REQUEUE_EXIT_CODE
+```
+
+- **Checkpoints happen only at block boundaries** (about every 500,000 tokens), every
+  `checkpoint_every_blocks` blocks (V2: 4, so about every 2 million tokens), and never
+  after the last block (`block_start < file_len`).
+- A **stop request is polled once per block**: if a file named `STOP_REQUESTED` appears
+  in the checkpoint directory, the job saves a checkpoint and exits **cleanly** with
+  code **75**. The wording in the source ("Slurm requeue") says that exit code is what a
+  Slurm job script uses to resubmit the job. That script is not in this repository, so I
+  am reading intent from the comments, not from running code.
+- `--stop_after_blocks` (the hidden flag from Part C) triggers the same exit after N
+  blocks: it is the **test hook** for exercising the stop-and-resume path without
+  waiting for a real stop.
+- `sys.exit(main())` (line 1738) passes that exit code to the shell.
+
+The cost of this design: up to **one block plus its retrain** of work can be lost if a
+job dies between checkpoints. The benefit is that a 7.5-day decode can be stopped and
+restarted any number of times and still produce exactly the same bytes.
+
+## The finish (lines 1603-1734)
+
+```python
+if encoder is not None:
+    encoder.finish()          # flush the coder's final bits
+    bit_out.close()           # pad the last byte with zeros, close the file
+```
+
+Then it measures **two different sizes**, and both are reported:
+
+| Number | From | Meaning |
+|---|---|---|
+| `modeled_payload_bytes = n_bits / 8` | the sum of the model's own `-log2 P` (D1, step 6) | What the model *says* it costs |
+| `actual_compressed_bytes` | `os.path.getsize` of the real output (or input when decoding) | What the file really is |
+
+They should agree to within a few bytes, since the coder reaches almost exactly the
+theoretical cost (your session 1 insight about the coder landing within ~3 bytes of the
+ideal).
+
+The headline figure:
+
+```python
+benchmark_total_bytes = actual_compressed_bytes + args.vocab_bytes + decompressor_bytes
+benchmark_total_bpb   = benchmark_total_bytes * 8 / args.raw_bytes
+```
+
+= **compressed payload + vocabulary (34,421 bytes) + zipped decompressor (the code, plus
+`weights.bin`)**, divided by the original 1,000,000,000 bytes. The code calls this the
+"benchmark total" (the Matt Mahoney size metric Part A mentioned).
+
+Then: write TensorBoard hyperparameters and results, log one machine-readable line,
+
+```
+FINAL_RESULT {...json: symbols, modeled_bits, modeled_bits_per_byte, actual_compressed_bytes,
+              vocab_bytes, prior_archive_bytes, prior_transmission_bytes, initial_prior_sha256,
+              benchmark_total_bytes, benchmark_total_bits_per_byte, elapsed_seconds, ...}
+```
+
+and a human summary (`done in ... s (... kS/s), ... bits/token, ... bits/byte`). Finally
+`mark_done` writes a `DONE` file in the checkpoint directory (presumably so a job
+script can tell a finished run from an interrupted one; no script here reads it), and
+`main()` returns `0`.
+
+---
+
+# The whole file in one picture
+
+```
+                 weights.bin (1-bit, 2 blocks)            input tokens (2-byte, 4,097 vocab)
+                        |                                       |
+                        v  Part B: read_tensor_archive,         |
+                        v  load_depth_prior (checks, copy)      |
+        Transformer, 12 blocks, 162.6M params   <--- Part A     |
+                        |                                       v
+                        +----------------->  D1: 64 streams x (predict 1 token each)
+                                                  |
+                                    make_freq_table (Part C) -> arithmetic coder (rank 0)
+                                                  |
+                              compressed bytes <--+
+                                                  |
+                              learn on the 64 new tokens (1 Adam step, eval mode)
+                                                  |
+        every 500K tokens:  D2: retrain on up to 35M earlier tokens (dropout on,
+                                separate optimizer, decaying LR)
+        every 4 blocks:     D2: checkpoint (atomic), resumable bit for bit
+        at the end:         D2: payload + vocab + zip(code + weights.bin) = the score
+```
+
+## What this walkthrough does **not** cover
+
+- **`preprocess.c`** (Bellard's tokenizer, in C): how text becomes the 4,097-token
+  stream.
+- **The inner workings of `arithmetic_coder.py`** beyond its `state_dict` methods.
+  Rung 1 builds the idea up from scratch, and you can read that file next.
+- **The Mamba and KDA backends**, the `learned_relative` position mode, and the
+  `ssm_*` / `kda_*` flags: alternative paths whose source files aren't in this repo.
+- **The Slurm job scripts and the README's run instructions.** I haven't read them, so
+  claims about the cluster are inferred from comments.
+- **Any measured run of the real model.** Every figure here that isn't read straight from
+  a file (e.g. 162,585,600 parameters, about 17,090 retrain steps) is arithmetic from the
+  settings.
+
+*End of the walkthrough.*
